@@ -260,14 +260,59 @@ def ImportVOC(path, path_to_images=None, name="dataset", encoding="utf-8"):
     return dataset
 
 
-def ImportYoloV5(
-    path,
-    img_ext="jpg,jpeg,png,webp",
-    cat_names=[],
-    path_to_images="",
-    name="dataset",
-    encoding="utf-8",
-):
+def get_image_metadata(image_path):
+    """Extract image dimensions and metadata"""
+    try:
+        imgstream = open(image_path, "rb")
+        imgbytes = np.asarray(bytearray(imgstream.read()), dtype=np.uint8)
+        im = cv2.imdecode(imgbytes, cv2.IMREAD_UNCHANGED)
+        
+        height, width = im.shape[:2]
+        depth = 1 if len(im.shape) == 2 else im.shape[2]
+        
+        return {
+            'img_width': width,
+            'img_height': height,
+            'img_depth': depth
+        }
+    except Exception as e:
+        raise RuntimeError(f"Failed to read image {image_path}: {e}")
+
+def load_yolo_annotations(txt_path, img_width, img_height, encoding="utf-8"):
+    """Load and convert YOLO annotations to absolute coordinates"""
+    annotations = []
+    if not os.path.exists(txt_path):
+        return annotations
+        
+    with open(txt_path, "r", encoding=encoding) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+                
+            values = line.split()
+            cat_id = int(values[0]) # Convert to int, handling potential float strings
+            x_center, y_center, width, height = map(float, values[1:])
+            
+            bbox_width = width * img_width
+            bbox_height = height * img_height
+            bbox_x = x_center * img_width - (bbox_width / 2)
+            bbox_y = y_center * img_height + (bbox_height / 2)
+            
+            annotations.append({
+                'cat_id': cat_id,  # Now an integer
+                'ann_bbox_width': bbox_width,
+                'ann_bbox_height': bbox_height,
+                'ann_bbox_xmin': bbox_x,
+                'ann_bbox_xmax': bbox_x + bbox_width,
+                'ann_bbox_ymin': bbox_y - bbox_height,
+                'ann_bbox_ymax': bbox_y,
+                'ann_area': bbox_width * bbox_height
+            })
+    return annotations
+
+def ImportYoloV5(path: str, path_to_images: str=None, cat_names: dict={0: "default"}, 
+                 img_ext:str ="jpg", name: str="dataset", add_negatives: bool=False):
     """
     Provide the path a directory with annotations in YOLO format and it returns a PyLabel dataset object that contains the annotations.
     The Yolo format does not store much information about the images, such as the height and width. When you import a
@@ -282,7 +327,7 @@ def ImportYoloV5(
          .jpeg, .png, etc. This is required because the YOLO format does not store the filename of the images.
          It could be any of the image formats supported by YoloV5. PyLabel will iterate through the file extensions
          specified until it finds a match.
-        cat_names (list): YOLO annotations only store a class number, not the name. You can provide a list of class ids
+        cat_names (dict): YOLO annotations only store a class number, not the name. You can provide a list of class ids
             that correspond to the int used to represent that class in the annotations. For example `['Squirrel,'Nut']`.
             If you have the class names already stored in a YOLO YAML file then use the ImportYoloV5WithYaml method to
             automatically read the class names from that file.
@@ -297,142 +342,64 @@ def ImportYoloV5(
         >>> from pylabel import importer
         >>> dataset = importer.ImportYoloV5(path="labels/", path_to_images="../images/")
     """
-
-    def GetCatNameFromId(cat_id, cat_names):
-        cat_id = int(cat_id)
-        if len(cat_names) > int(cat_id):
-            return cat_names[cat_id]
-
-    # Create an empty dataframe
-    df = pd.DataFrame(columns=schema)
-
-    # the dictionary to pass to pandas dataframe
-    d = {}
-
-    row_id = 0
-    img_id = 0
-
-    # iterate over files in that directory
-    pbar = tqdm(desc="Importing YOLO files...", total=len(os.listdir(path)))
-    for filename in os.scandir(path):
-        if filename.is_file() and filename.name.endswith(".txt"):
-            filepath = filename.path
-            file = open(filepath, "r", encoding=encoding)  # Read file
-            row = {}
-
-            # First find the image files and extract the metadata about the image
-            row["img_folder"] = path_to_images
-
-            # Figure out what the extension is of the corresponding image file
-            # by looping through the extension in the img_ext parameter
-            found_image = False
-            for ext in img_ext.split(","):
-                image_filename = filename.name.replace("txt", ext)
-
-                # Get the path to the image file to extract the height, width, and depth
-                image_path = PurePath(path, path_to_images, image_filename)
-                if exists(image_path):
-                    found_image = True
-                    break
-
-            # Check if there is a file at this location.
-            assert (
-                found_image == True
-            ), f"No image file found: {image_path}. Check path_to_images and img_ext arguments."
-
-            row["img_filename"] = image_filename
-
-            imgstream = open(str(image_path), "rb")
-            imgbytes = bytearray(imgstream.read())
-            numpyarray = np.asarray(imgbytes, dtype=np.uint8)
-
-            im = cv2.imdecode(numpyarray, cv2.IMREAD_UNCHANGED)
-
-            img_height = im.shape[0]
-            img_width = im.shape[1]
-            # If the image is grayscale then there is no img_depth
-            if len(im.shape) == 2:
-                img_depth = 1
-            else:
-                img_depth = im.shape[2]  # 3 for color images
-
-            row["img_id"] = img_id
-            row["img_width"] = img_width
-            row["img_height"] = img_height
-            row["img_depth"] = img_depth
-
-            # Read the annotation in the file
-            # Check if the file has at least one line:
-            numlines = len(open(filepath, encoding=encoding).readlines())
-            if numlines == 0:
-                # Create a row without annotations
-                d[row_id] = row
-                row_id += 1
-            else:
-                for line in file:
-                    line = line.strip()
-
-                    # check if the row is empty, leave annotation columns blank
-                    if line:
-                        d[row_id] = copy.deepcopy(row)
-                        (
-                            cat_id,
-                            x_center_norm,
-                            y_center_norm,
-                            width_norm,
-                            height_norm,
-                        ) = line.split()
-
-                        row["ann_bbox_width"] = float(width_norm) * img_width
-                        row["ann_bbox_height"] = float(height_norm) * img_height
-                        row["ann_bbox_xmin"] = float(x_center_norm) * img_width - (
-                            (row["ann_bbox_width"] / 2)
-                        )
-                        row["ann_bbox_ymax"] = float(y_center_norm) * img_height + (
-                            (row["ann_bbox_height"] / 2)
-                        )
-                        row["ann_bbox_xmax"] = (
-                            row["ann_bbox_xmin"] + row["ann_bbox_width"]
-                        )
-                        row["ann_bbox_ymin"] = (
-                            row["ann_bbox_ymax"] - row["ann_bbox_height"]
-                        )
-
-                        row["ann_area"] = row["ann_bbox_width"] * row["ann_bbox_height"]
-
-                        row["cat_id"] = cat_id
-                        row["cat_name"] = GetCatNameFromId(cat_id, cat_names)
-
-                        d[row_id] = dict(row)
-                        row_id += 1
-                        # Copy the image data to use for the next row
-                    else:
-                        # Create a row without annotations
-                        d[row_id] = row
-                        row_id += 1
-
-                # Add this row to the dict
-        # increment the image id
-        img_id += 1
-        pbar.update()
-
-    df = pd.DataFrame.from_dict(d, "index", columns=schema)
+    # Find image files
+    abs_image_path = os.path.abspath(os.path.join(os.path.dirname(path), path_to_images))
+    image_files = [
+        os.path.join(root, f) 
+        for root, _, files in os.walk(abs_image_path)
+        for f in files if any(f.lower().endswith(ext.strip()) for ext in img_ext.split(','))
+    ]
+    
+    # Filter images based on annotations existence
+    if not add_negatives:
+        image_files = [
+            img_path for img_path in image_files
+            if os.path.exists(os.path.join(path, f"{Path(img_path).stem}.txt"))
+        ]
+    
+    # Process images and annotations
+    records = []
+    for img_id, img_path in enumerate(tqdm(image_files, desc="Importing YOLO files...")):
+            # Get image metadata
+        img_meta = get_image_metadata(img_path)
+        base_record = {
+            'img_folder': path_to_images,
+            'img_filename': img_path,
+            'img_path': img_path,
+            'img_id': img_id,
+            **img_meta
+        }
+        
+        # Load annotations
+        txt_path = os.path.join(path, f"{Path(img_path).stem}.txt")
+        annotations = load_yolo_annotations(
+            txt_path, 
+            img_meta['img_width'], 
+            img_meta['img_height']
+        )
+        
+        # Create records
+        if annotations:
+            for ann in annotations:
+                records.append({
+                    **base_record,
+                    **ann,
+                    'cat_name': cat_names.get(int(ann['cat_id']), ''),
+                    'annotated': 1
+                })
+        else:
+            records.append({**base_record, 'annotated': 0})
+            
+    
+    # Create dataset
+    df = pd.DataFrame.from_records(records, columns=schema)
     df.index.name = "id"
-    df.annotated = 1
     df.fillna("", inplace=True)
-
-    # These should be strings
-    df.cat_id = df.cat_id.astype(str)
-
-    # These should be integers
-    df.img_width = df.img_width.astype(int)
-    df.img_height = df.img_height.astype(int)
-
-    # Reorder columns
+    
     dataset = Dataset(df)
     dataset.name = name
     dataset.path_to_annotations = path
-
+    
     return dataset
 
 

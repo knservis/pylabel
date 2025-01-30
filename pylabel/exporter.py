@@ -761,150 +761,129 @@ class Export:
             ['data/labels/dataset.json']
 
         """
-        # Copy the dataframe in the dataset so the original dataset doesn't change when you apply the export tranformations
+        # Prepare dataframe
         df = self.dataset.df.copy(deep=True)
-        # Replace empty string values with NaN
         df = df.replace(r"^\s*$", np.nan, regex=True)
-        pd.to_numeric(df["cat_id"])
-
         df["ann_iscrowd"] = df["ann_iscrowd"].fillna(0)
-
-        if cat_id_index != None:
-            assert isinstance(cat_id_index, int), "cat_id_index must be an int."
+        
+        if cat_id_index is not None:
+            assert isinstance(cat_id_index, int), "cat_id_index must be int"
             _ReindexCatIds(df, cat_id_index)
-
-        df_outputI = []
-        df_outputA = []
-        df_outputC = []
-        list_i = []
-        list_c = []
-        json_list = []
-
-        pbar = tqdm(desc="Exporting to COCO file...", total=df.shape[0])
-        for i in range(0, df.shape[0]):
-            images = [
-                {
-                    "id": df["img_id"][i],
-                    "folder": df["img_folder"][i],
-                    "file_name": df["img_filename"][i],
-                    "path": df["img_path"][i],
-                    "width": df["img_width"][i],
-                    "height": df["img_height"][i],
-                    "depth": df["img_depth"][i],
-                }
-            ]
-
-            # Skip this if cat_id is na
-            if not pd.isna(df["cat_id"][i]):
-                annotations = [
-                    {
-                        "image_id": df["img_id"][i],
-                        "id": df.index[i],
-                        "segmented": df["ann_segmented"][i],
-                        "bbox": [
-                            df["ann_bbox_xmin"][i],
-                            df["ann_bbox_ymin"][i],
-                            df["ann_bbox_width"][i],
-                            df["ann_bbox_height"][i],
-                        ],
-                        "area": df["ann_area"][i],
-                        "segmentation": df["ann_segmentation"][i],
-                        "iscrowd": df["ann_iscrowd"][i],
-                        "pose": df["ann_pose"][i],
-                        "truncated": df["ann_truncated"][i],
-                        "category_id": int(df["cat_id"][i]),
-                        "difficult": df["ann_difficult"][i],
-                    }
-                ]
-
-                # include keypoints, if available
-                if "ann_keypoints" in df.keys() and (not np.isnan(df["ann_keypoints"][i]).all()):
-                    keypoints = df["ann_keypoints"][i]
-                    if isinstance(keypoints, list):
-                        n_keypoints = int(len(keypoints) / 3)  # 3 numbers per keypoint: x,y,visibility
-                    elif isinstance(keypoints, np.ndarray):
-                        n_keypoints = int(keypoints.size / 3)  # 3 numbers per keypoint: x,y,visibility
-                    else:
-                        raise TypeError('The keypoints array is expected to be either a list or a numpy array')
-                    annotations[0]["num_keypoints"] = n_keypoints
-                    annotations[0]["keypoints"] = keypoints
-                else:
-                    pass
-
-                categories = [
-                    {
-                        "id": int(df["cat_id"][i]),
-                        "name": df["cat_name"][i],
-                        "supercategory": df["cat_supercategory"][i],
-                    }
-                ]
-
-                # Check if the list is empty
-                if list_c:
-                    if categories[0]["id"] in list_c:
-                        pass
-                    else:
-                        categories[0]["id"] = int(categories[0]["id"])
-                        df_outputC.append(pd.DataFrame([categories]))
-                elif not pd.isna(categories[0]["id"]):
-                    categories[0]["id"] = int(categories[0]["id"])
-                    df_outputC.append(pd.DataFrame([categories]))
-                else:
-                    pass
-                list_c.append(categories[0]["id"])
-
-            if list_i:
-                if images[0]["id"] in list_i or np.isnan(images[0]["id"]):
-                    pass
-                else:
-                    df_outputI.append(pd.DataFrame([images]))
-            elif ~np.isnan(images[0]["id"]):
-                df_outputI.append(pd.DataFrame([images]))
-            else:
-                pass
-            list_i.append(images[0]["id"])
-
-            # If the class id is blank, then there is no annotation to add
-            if not pd.isna(categories[0]["id"]):
-                df_outputA.append(pd.DataFrame([annotations]))
-
-            pbar.update()
-
-        mergedI = pd.concat(df_outputI, ignore_index=True)
-        mergedA = pd.concat(df_outputA, ignore_index=True)
-        mergedC = pd.concat(df_outputC, ignore_index=True)
-
-        resultI = mergedI[0].to_json(orient="split", default_handler=str)
-        resultA = mergedA[0].to_json(orient="split", default_handler=str)
-        resultC = mergedC[0].to_json(orient="split", default_handler=str)
-
-        parsedI = json.loads(resultI)
-        del parsedI["index"]
-        del parsedI["name"]
-        parsedI["images"] = parsedI["data"]
-        del parsedI["data"]
-
-        parsedA = json.loads(resultA)
-        del parsedA["index"]
-        del parsedA["name"]
-        parsedA["annotations"] = parsedA["data"]
-        del parsedA["data"]
-
-        parsedC = json.loads(resultC)
-        del parsedC["index"]
-        del parsedC["name"]
-        parsedC["categories"] = parsedC["data"]
-        del parsedC["data"]
-
-        parsedI.update(parsedA)
-        parsedI.update(parsedC)
-        json_output = parsedI
-
-        if output_path == None:
-            output_path = Path(
-                self.dataset.path_to_annotations, (self.dataset.name + ".json")
-            )
-
-        with open(output_path, "w") as outfile:
-            json.dump(obj=json_output, fp=outfile, indent=4)
+        
+        # Process unique images
+        # Use img_filename as the unique identifier if img_id is not available
+        images = (df.groupby('img_filename', as_index=False)
+                 .agg({
+                     'img_id': 'first',
+                     'img_folder': 'first',
+                     'img_path': 'first',
+                     'img_width': 'first',
+                     'img_height': 'first',
+                     'img_depth': 'first'
+                 })
+                 .apply(_create_image_dict, axis=1)
+                 .tolist())
+        
+        # Process annotations
+        annotations = []
+        categories_set = set()
+        categories = []
+        
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Exporting to COCO"):
+            if pd.isna(row["cat_id"]):
+                continue
+                
+            annotations.append(_create_annotation_dict(row, idx))
+            
+            # Add unique categories
+            cat_id = int(row["cat_id"])
+            if cat_id not in categories_set:
+                categories.append(_create_category_dict(row))
+                categories_set.add(cat_id)
+        
+        # Create COCO format JSON
+        coco_dict = {
+            "images": images,
+            "annotations": annotations,
+            "categories": categories
+        }
+        
+        # Save to file
+        if output_path is None:
+            output_path = Path(self.dataset.path_to_annotations, f"{self.dataset.name}.json")
+        
+        # Replace NaN values with None before JSON serialization
+        def clean_nan(obj):
+            if isinstance(obj, dict):
+                return {k: clean_nan(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_nan(x) for x in obj]
+            elif pd.isna(obj):
+                return None
+            return obj
+            
+        coco_dict_clean = clean_nan(coco_dict)
+        with open(output_path, "w") as f:
+            json.dump(coco_dict_clean, f, indent=4)
+        
         return [str(output_path)]
+
+def _process_keypoints(row):
+    """Handle keypoint processing for annotations"""
+    if "ann_keypoints" not in row or np.isnan(row["ann_keypoints"]).all():
+        return {}
+    
+    keypoints = row["ann_keypoints"]
+    if not isinstance(keypoints, (list, np.ndarray)):
+        raise TypeError('Keypoints must be list or numpy array')
+    
+    n_keypoints = len(keypoints) // 3 if isinstance(keypoints, list) else keypoints.size // 3
+    return {"num_keypoints": n_keypoints, "keypoints": keypoints}
+
+def _create_image_dict(row):
+    """Create image dictionary from dataframe row"""
+    return {
+        "id": row["img_id"],
+        "folder": row["img_folder"], 
+        "file_name": row["img_filename"],
+        "path": row["img_path"],
+        "width": row["img_width"],
+        "height": row["img_height"],
+        "depth": row["img_depth"]
+    }
+
+def _create_annotation_dict(row, index):
+    """Create annotation dictionary from dataframe row"""
+    annotation = {
+        "image_id": row["img_id"],
+        "id": index,
+        "segmented": row["ann_segmented"],
+        "bbox": [
+            row["ann_bbox_xmin"],
+            row["ann_bbox_ymin"],
+            row["ann_bbox_width"],
+            row["ann_bbox_height"]
+        ],
+        "area": row["ann_area"],
+        "segmentation": row["ann_segmentation"],
+        "iscrowd": row["ann_iscrowd"],
+        "pose": row["ann_pose"],
+        "truncated": row["ann_truncated"],
+        "category_id": int(row["cat_id"]),
+        "difficult": row["ann_difficult"]
+    }
+    
+    # Add keypoints if present
+    keypoints_data = _process_keypoints(row)
+    if keypoints_data:
+        annotation.update(keypoints_data)
+    
+    return annotation
+
+def _create_category_dict(row):
+    """Create category dictionary from dataframe row"""
+    return {
+        "id": int(row["cat_id"]),
+        "name": row["cat_name"],
+        "supercategory": row["cat_supercategory"]
+    }

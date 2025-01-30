@@ -311,6 +311,13 @@ def load_yolo_annotations(txt_path, img_width, img_height, encoding="utf-8"):
             })
     return annotations
 
+def normalize_paths(path, path_to_images, img_path):
+    """Normalize paths to be relative to input path"""
+    base_path = os.path.abspath(os.path.dirname(path))
+    rel_img_path = os.path.relpath(img_path, base_path)
+    filename = os.path.basename(img_path)
+    return rel_img_path, filename
+
 def ImportYoloV5(path: str, path_to_images: str=None, cat_names: dict={0: "default"}, 
                  img_ext:str ="jpg", name: str="dataset", add_negatives: bool=False):
     """
@@ -360,37 +367,42 @@ def ImportYoloV5(path: str, path_to_images: str=None, cat_names: dict={0: "defau
     # Process images and annotations
     records = []
     for img_id, img_path in enumerate(tqdm(image_files, desc="Importing YOLO files...")):
-            # Get image metadata
-        img_meta = get_image_metadata(img_path)
-        base_record = {
-            'img_folder': path_to_images,
-            'img_filename': img_path,
-            'img_path': img_path,
-            'img_id': img_id,
-            **img_meta
-        }
-        
-        # Load annotations
-        txt_path = os.path.join(path, f"{Path(img_path).stem}.txt")
-        annotations = load_yolo_annotations(
-            txt_path, 
-            img_meta['img_width'], 
-            img_meta['img_height']
-        )
-        
-        # Create records
-        if annotations:
-            for ann in annotations:
-                records.append({
-                    **base_record,
-                    **ann,
-                    'cat_name': cat_names.get(int(ann['cat_id']), ''),
-                    'annotated': 1
-                })
-        else:
-            records.append({**base_record, 'annotated': 0})
+        try:
+            # Normalize paths
+            rel_img_path, filename = normalize_paths(path, path_to_images, img_path)
             
-    
+            # Get image metadata
+            img_meta = get_image_metadata(img_path)
+            base_record = {
+                'img_folder': path_to_images,
+                'img_filename': filename,  # Just the filename
+                'img_path': rel_img_path,  # Relative path
+                'img_id': img_id,
+                **img_meta
+            }
+            
+            # Load annotations
+            txt_path = os.path.join(path, f"{Path(img_path).stem}.txt")
+            annotations = load_yolo_annotations(
+                txt_path, 
+                img_meta['img_width'], 
+                img_meta['img_height']
+            )
+            
+            # Create records
+            if annotations:
+                for ann in annotations:
+                    records.append({
+                        **base_record,
+                        **ann,
+                        'cat_name': cat_names.get(int(ann['cat_id']), ''),
+                        'annotated': 1
+                    })
+            else:
+                records.append({**base_record, 'annotated': 0})
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+            
     # Create dataset
     df = pd.DataFrame.from_records(records, columns=schema)
     df.index.name = "id"

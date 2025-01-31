@@ -438,8 +438,63 @@ class Export:
                     else:
                         formatted_row.append(str(x))
                 f.write(sep.join(formatted_row) + '\n')
-
     def ExportToYoloV5(
+        self,
+        output_path="training/labels",
+        yaml_file="dataset.yaml",
+        copy_images=False,
+        use_splits=False,
+        cat_id_index=None,
+        segmentation=False,
+        keypoints=False,
+    ):
+        """Writes annotation files to disk in YOLOv5 format"""
+        # Setup
+        df = self.dataset.df.copy()
+        
+        # Convert fields to numeric
+        numeric_fields = ['cat_id', 'ann_bbox_xmin', 'ann_bbox_ymin', 
+                         'ann_bbox_width', 'ann_bbox_height']
+        
+        for field in numeric_fields:
+            df[field] = df[field].replace(r'^\s*$', np.nan, regex=True)
+            df[field] = pd.to_numeric(df[field])
+        
+        if cat_id_index is not None:
+            _ReindexCatIds(df, cat_id_index)
+        
+        # Create directories
+        output_path = _setup_yolo_dirs(output_path, use_splits)
+        
+        # Process annotations
+        for _, row in tqdm(df.iterrows(), desc="Exporting YOLO annotations"):
+            # Determine output paths
+            split_dir = row['split'] if use_splits else ''
+            label_dir = os.path.join(output_path, 'labels', split_dir)
+            image_dir = os.path.join(output_path, 'images', split_dir)
+            
+            # Convert and write annotation
+            yolo_ann = _convert_to_yolo_format(row, segmentation, keypoints)
+            base_name = os.path.splitext(os.path.basename(row['img_filename']))[0]
+            with open(os.path.join(label_dir, f"{base_name}.txt"), 'w') as f:
+                f.write(yolo_ann)
+            
+            # Copy image if requested
+            if copy_images:
+                shutil.copy2(
+                    os.path.join(row['img_folder'], row['img_filename']),
+                    os.path.join(image_dir, row['img_filename'])
+                )
+        
+        # Create YAML if requested
+        if yaml_file:
+            yaml_path = os.path.join(os.path.dirname(output_path), yaml_file)
+            _create_yolo_yaml(yaml_path, self.dataset, use_splits)
+            return [output_path, yaml_path]
+        
+        return [output_path]
+
+    def ExportToYoloV5Old(
         self,
         output_path="training/labels",
         yaml_file="dataset.yaml",
@@ -887,3 +942,104 @@ def _create_category_dict(row):
         "name": row["cat_name"],
         "supercategory": row["cat_supercategory"]
     }
+
+def _setup_yolo_dirs(output_path, use_splits=False):
+    """Create YOLO directory structure"""
+    if use_splits:
+        for split in ['train', 'val', 'test']:
+            os.makedirs(os.path.join(output_path, 'labels', split), exist_ok=True)
+            os.makedirs(os.path.join(output_path, 'images', split), exist_ok=True)
+    else:
+        os.makedirs(os.path.join(output_path, 'labels'), exist_ok=True)
+        os.makedirs(os.path.join(output_path, 'images'), exist_ok=True)
+    return output_path
+
+def _create_yolo_yaml(yaml_path, dataset, use_splits=False):
+    """Generate YAML configuration file"""
+    yaml_content = {
+        'path': os.path.dirname(yaml_path),
+        'nc': dataset.analyze.num_classes,
+        'names': dataset.analyze.classes
+    }
+    
+    if use_splits:
+        yaml_content.update({
+            'train': 'images/train',
+            'val': 'images/val',
+            'test': 'images/test'
+        })
+    
+    with open(yaml_path, 'w') as f:
+        yaml.dump(yaml_content, f, sort_keys=False)
+
+def _convert_to_yolo_format(row, segmentation=False, keypoints=False):
+    """Convert annotation to YOLO format"""
+    if segmentation and row.get('ann_segmentation'):
+        return _convert_segmentation(row)
+    elif keypoints and row.get('ann_keypoints'):
+        return _convert_keypoints(row)
+    else:
+        return _convert_bbox(row)
+
+def _convert_segmentation(row):
+    """Convert segmentation annotation to YOLO format"""
+    result = f"{int(row['cat_id'])}"
+    if row['ann_segmentation']:
+        segmentation_array = row['ann_segmentation'][0]
+        for i, coord in enumerate(segmentation_array):
+            # Normalize x coordinates by width
+            if i % 2 == 0:
+                normalized = coord / row['img_width']
+            # Normalize y coordinates by height
+            else:
+                normalized = coord / row['img_height']
+            result += f" {normalized:.6f}"
+    return result
+
+def _convert_keypoints(row):
+    """Convert keypoints annotation to YOLO format"""
+    bbox = _convert_bbox(row)
+    if not row['ann_keypoints']:
+        return bbox
+        
+    keypoints = []
+    for i in range(0, len(row['ann_keypoints']), 3):
+        x = row['ann_keypoints'][i] / row['img_width']
+        y = row['ann_keypoints'][i+1] / row['img_height']
+        v = row['ann_keypoints'][i+2]
+        keypoints.extend([x, y, v])
+    
+    return f"{bbox} {' '.join(f'{k:.6f}' for k in keypoints)}"
+
+def _convert_bbox(row):
+    """Convert bbox coordinates to YOLO format"""
+    # Check for empty values
+    if (pd.isna(row['ann_bbox_xmin']) or 
+        pd.isna(row['ann_bbox_width']) or 
+        pd.isna(row['ann_bbox_ymin']) or 
+        pd.isna(row['ann_bbox_height']) or
+        pd.isna(row['cat_id']) or
+        row['cat_id'] == ''):
+        return ""
+        
+    try:
+        # Convert all values using numpy for consistent NaN handling
+        cat_id = int(float(row['cat_id'])) if row['cat_id'] != '' else 0
+        img_width = np.float64(row['img_width'])
+        img_height = np.float64(row['img_height'])
+        bbox_xmin = np.float64(row['ann_bbox_xmin'] or 0)
+        bbox_width = np.float64(row['ann_bbox_width'] or 0)
+        bbox_ymin = np.float64(row['ann_bbox_ymin'] or 0)
+        bbox_height = np.float64(row['ann_bbox_height'] or 0)
+        
+        x_center = (bbox_xmin + (bbox_width / 2)) / img_width
+        y_center = (bbox_ymin + (bbox_height / 2)) / img_height
+        width = bbox_width / img_width
+        height = bbox_height / img_height
+        
+        return f"{cat_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+    except Exception as e:
+        print(f"Error in row: {row}")
+        raise
+
+
